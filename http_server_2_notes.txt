@@ -1,0 +1,74 @@
+# HTTP Server 2 - build notes
+
+Picking up where server 1 left off. This one started as "find the bug" instead of building from scratch, which was a different kind of exercise - more debugging muscle than writing muscle.
+
+## Part 1: the bug
+
+Ran the starter code, hit it with curl, got:
+
+```
+TypeError: 'NoneType' object is not subscriptable
+```
+
+on this line:
+```
+if client_request.parsed_request['uri'] == '/':
+```
+
+First instinct was to check where `parsed_request` gets set. Found `self.parsed_request = None` sitting inside `parse_request()`, and that was it - the whole method. It took the decoded request lines as a parameter and then just... didn't do anything with them. Set `parsed_request` to None and returned. So no matter what came in, it always ended up None, and trying to do `None['uri']` blows up because you can't index into None like a dict.
+
+The fix connected back to what I'd already built in server 1 - same request line splitting logic (method/uri/version), just needed to land differently this time. This server's while loop was written expecting `parsed_request` to be a **dict** with a `'uri'` key, not separate attributes like `self.path` from before. So I had to:
+- init `self.parsed_request = {}` instead of None
+- still parse method/path/version the same way as before
+- but assign them into the dict (`self.parsed_request['method'] = ...` etc) instead of as their own attributes
+
+Once that was in, `curl http://localhost:9292/` actually returned the Hello World HTML instead of crashing.
+
+## Part 2: /time returning JSON
+
+New thing here - hadn't touched the `json` module before. Core idea: `json.dumps(some_dict)` turns a Python dict into a JSON-formatted string. That's it, that's the whole tool. Wrote `build_json_response(data)` mirroring the existing `build_html_response` structure - same status line / headers / blank line / body shape, just `Content-Type: application/json` instead of `text/html`, and the body built with `json.dumps()` instead of html tag wrapping.
+
+Small thing I almost missed: `datetime.datetime.now()` returns an actual datetime object, not a string, and `json.dumps()` won't serialize that directly. Had to wrap it in `str()` first before putting it in the dict.
+
+## Reasoning through the "things to think about" questions
+
+**Port question** - realized the real point wasn't really about 9292 vs 9295 specifically, it was noticing that the port number was hardcoded in two separate places in the file (the bind() call and a print statement). If you only change one, the print statement starts lying to you about what port the server's actually on. Pulled it into a single `PORT = 9292` variable at the top so there's one source of truth.
+
+Also walked through what actually happens if you try to bind a port that's already in use by a live process - straight up errors out, `Address already in use`. Learned SO_REUSEADDR isn't actually about letting two live servers share a port (that's never allowed) - it's about letting you rebind quickly after killing your own server, before the OS finishes its normal cleanup delay on the old socket.
+
+## Stretch: 404 for unknown routes
+
+Needed an `else` at the end of the if/elif chain. Before this, hitting a path that didn't match anything just silently did nothing - no branch matched, nothing got sent, connection closed empty. Same "empty reply" symptom I'd already seen once before in server 1 from a different bug, so at least I recognized the shape of it immediately this time.
+
+Went back and forth on whether to write a whole separate function for building a 404 response, but landed on modifying `build_html_response` instead - added `status_code` and `status_message` as parameters with defaults (`200`/`"OK"`), so the existing calls didn't need to change at all, and the 404 branch could just pass different values in.
+
+## Stretch: /users from CSV
+
+First time really using the `csv` module. `csv.DictReader` reads each row and turns it straight into a dict using the header row as keys - so a whole file becomes a list of dicts basically for free, which was convenient since `json.dumps()` already knows how to handle that. Loaded it once at the top of the file (outside the loop, since the data doesn't change per-request) into a `users` list, then just handed it to the response builder same as the /time data. Wrapped it as `{"users": users}` instead of sending the bare list, figured that's more consistent with the /time response also being an object with a named key.
+
+## Stretch: rejecting non-GET methods (405)
+
+This one needed actual thought about ordering, not just mechanics. Almost checked the URI first and handled method second, but walked through what would happen with something like `POST /time` - if URI gets checked first, the /time branch would match and just process the request normally, completely ignoring the wrong method. No natural place left to catch it. Flipped it around: check method first, before any URI logic runs at all. If it's not GET, short-circuit straight to a 405 and skip URI routing entirely.
+
+Caused a dumb bug when I first wrote it - had a `client_connection.close()` inside the 405 branch AND the one at the bottom of the loop that runs for every branch. Would've been calling close() twice on the same connection for that one branch. Fixed by just deleting the one inside the branch and letting the single close() at the end handle every case consistently, no exceptions.
+
+## Stretch: Response class
+
+This was the big design one. Started by literally trying to copy the two build_*_response functions straight into a class as methods, which didn't actually accomplish anything - ended up calling `Response(...).build_html_response(...)`, passing the same status code and message twice in one line. That repetition was the tell that something was structured wrong.
+
+The actual insight, walked through step by step: a Response object shouldn't need to know or care whether its body came from HTML tag-wrapping or json.dumps(). By the time Response gets the body, that conversion should already be done. So Response's real job is just: take a finished body string + status code/message + content type, and handle the two things that are identical across every response no matter the content type - calculating Content-Length correctly, and assembling the final status-line/headers/blank-line/body string. That's it. Content type and body-building are the *caller's* job (the while loop), not the class's.
+
+Ended up with a Response class that's basically just one `__init__` - takes status_code, status_message, content_type, body, computes body_length internally, and builds the whole response string into `self.raw_response`. No separate methods needed at all once I stopped trying to make it do content-type-specific work.
+
+Rewired every branch in the loop to: build the body first (json.dumps or html wrapping, whichever applies), pass it into Response along with the status info, then always end with `client_connection.send(response.raw_response.encode())` - same closing line regardless of which endpoint matched, which is exactly what the requirement asked for.
+
+## Stuff I want to remember
+
+- when a while loop's if/elif/else has multiple branches doing the exact same last step (like `.close()`), check whether that step is duplicated somewhere it shouldn't be
+- ordering matters when checks build on each other - method-before-URI here, same category of thing as "check the more general condition first"
+- json.dumps() takes a dict, gives back a string - can't serialize non-JSON-native types like datetime objects directly, wrap them in str() first
+- csv.DictReader turns rows into dicts automatically using the header row - way less manual than I expected
+- the real tell that a class design is off: if you're passing the same values into it twice (once to the constructor, once to a method call right after), something's not actually using what got stored
+- a class's job is defined by what's identical across all its uses, not by copy-pasting every variant into it as separate methods
+
+All 5 routes tested and confirmed working: `/`, `/time`, `/users`, unknown path -> 404, POST to a GET-only route -> 405.
